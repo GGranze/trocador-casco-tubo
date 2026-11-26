@@ -757,24 +757,49 @@ except (ProjetoInviavel, ValueError, ZeroDivisionError) as err:
 # FUNÇÕES AUXILIARES PARA SENSIBILIDADE E VARREDURA
 # ==============================================================================
 METRICAS = {
+    # Econômicas
     "Custo Total — Ctot [€]": ("Ctot", 1.0, "{:,.0f} €"),
     "Custo Inicial — Ci [€]": ("Ci", 1.0, "{:,.0f} €"),
     "Custo Operacional — Cod [€]": ("Cod", 1.0, "{:,.0f} €"),
+    # Térmicas (global e local)
     "Área de Troca — A [m²]": ("A", 1.0, "{:.2f} m²"),
     "Coeficiente Global — U [W/m²K]": ("U", 1.0, "{:.1f} W/m²K"),
+    "Coef. Convectivo Tubo — h_t [W/m²K]": ("h_t", 1.0, "{:.1f} W/m²K"),
+    "Coef. Convectivo Casco — h_s [W/m²K]": ("h_s", 1.0, "{:.1f} W/m²K"),
+    # Hidráulicas e regime de escoamento
     "Perda de Carga Casco — ΔP_s [kPa]": ("dP_s", 1e-3, "{:.2f} kPa"),
     "Perda de Carga Tubo — ΔP_t [kPa]": ("dP_t", 1e-3, "{:.2f} kPa"),
+    "Potência de Bombeamento — P [W]": ("potencia", 1.0, "{:,.1f} W"),
+    "Reynolds Tubo — Re_t": ("Re_t", 1.0, "{:,.0f}"),
+    "Reynolds Casco — Re_s": ("Re_s", 1.0, "{:,.0f}"),
+    "Velocidade Tubo — v_t [m/s]": ("v_t", 1.0, "{:.3f} m/s"),
+    "Velocidade Casco — v_s [m/s]": ("v_s", 1.0, "{:.3f} m/s"),
+    # Geométricas e mérito termo-hidráulico
     "Comprimento dos Tubos — L [m]": ("L", 1.0, "{:.2f} m"),
+    "Razão de Aspecto — L / Ds": (lambda r: r.L / r.Ds, 1.0, "{:.2f}"),
+    "Eficiência Termo-Hidráulica — q / P [kW_t / kW_e]": (
+        lambda r: r.q / r.potencia if r.potencia > 0 else float("nan"),
+        1.0,
+        "{:,.1f}",
+    ),
 }
+
+
+def _valor_metrica(r, campo, escala: float) -> float:
+    bruto = campo(r) if callable(campo) else getattr(r, campo)
+    return float(bruto) * escala
 
 
 def _sinal_termico(e: Especificacao) -> float:
     return 1.0 if e.Ti_casco > e.To_casco else -1.0
 
 
-def calcular_tornado(esp_base: Especificacao, ds_b: float, do_b: float, b_b: float, attr: str, escala: float, pct: float):
+def calcular_tornado(esp_base: Especificacao, ds_b: float, do_b: float, b_b: float, attr, escala: float, pct: float):
     r_base = avaliar(esp_base, ds_b, do_b, b_b)
-    v_base = getattr(r_base, attr) * escala
+    v_base = _valor_metrica(r_base, attr, escala)
+    if not np.isfinite(v_base) or v_base == 0:
+        return pd.DataFrame(), v_base
+
     sinal = _sinal_termico(esp_base)
     fs, ft = esp_base.fluido_casco, esp_base.fluido_tubo
 
@@ -810,9 +835,9 @@ def calcular_tornado(esp_base: Especificacao, ds_b: float, do_b: float, b_b: flo
     f_menos, f_mais = 1.0 - pct / 100.0, 1.0 + pct / 100.0
     for nome, fn in testes:
         try:
-            v_menos = getattr(fn(f_menos), attr) * escala
-            v_mais = getattr(fn(f_mais), attr) * escala
-            if not (np.isfinite(v_menos) and np.isfinite(v_mais)) or v_base == 0:
+            v_menos = _valor_metrica(fn(f_menos), attr, escala)
+            v_mais = _valor_metrica(fn(f_mais), attr, escala)
+            if not (np.isfinite(v_menos) and np.isfinite(v_mais)):
                 continue
             d_menos = 100.0 * (v_menos - v_base) / v_base
             d_mais = 100.0 * (v_mais - v_base) / v_base
