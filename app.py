@@ -1,4 +1,5 @@
 """Aplicativo Interativo — Projeto e Otimização de Trocador de Calor Casco-Tubo (GWO)."""
+import math
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -8,7 +9,7 @@ import streamlit as st
 from trocador_gwo.casos import CASOS, PROJETOS_PAPER
 from trocador_gwo.fluidos import FLUIDOS, fluido_custom
 from trocador_gwo.modelo import Especificacao, avaliar
-from trocador_gwo.termica import ProjetoInviavel
+from trocador_gwo.termica import ProjetoInviavel, fator_correcao
 
 try:
     from trocador_gwo.otimizador import (
@@ -36,6 +37,398 @@ NOMES_CASOS = {
     3: "Caso 3 — Água destilada / Água bruta (0,46 MW)",
 }
 LISTA_FLUIDOS = list(FLUIDOS.keys())
+
+
+# ==============================================================================
+# FUNÇÕES DE DIAGNÓSTICO GUIADO (AÇÃO + JUSTIFICATIVA)
+# ==============================================================================
+def limites_seguros_f(Ti_s: float, To_s: float, Ti_t: float, To_t: float):
+    """Calcula limites exatos de temperatura para existência do fator F (passes >= 2).
+
+    A condição exata da Eq. (5) é: a + b + sqrt(a² + b²) < 2·D,
+    onde a = |Ti_s - To_s|, b = |To_t - Ti_t|, D = |Ti_s - Ti_t|.
+    """
+    casco_quente = Ti_s > To_s
+    a = abs(Ti_s - To_s)
+    b = abs(To_t - Ti_t)
+    D = abs(Ti_s - Ti_t)
+    lim = {}
+
+    if D > a > 0 and (2 * D - a) > 0:
+        b_max = 2.0 * D * (D - a) / (2.0 * D - a)
+        lim["b_max"] = b_max
+        lim["To_t_lim"] = (Ti_t + b_max) if casco_quente else (Ti_t - b_max)
+
+    if D > b > 0 and (2 * D - b) > 0:
+        a_max = 2.0 * D * (D - b) / (2.0 * D - b)
+        lim["a_max"] = a_max
+        lim["To_s_lim"] = (Ti_s - a_max) if casco_quente else (Ti_s + a_max)
+
+    c = abs(To_s - Ti_t)
+    if (2 * c - b) > 1e-9 and b > c:
+        x_min = 2.0 * c * (b - c) / (2.0 * c - b)
+        lim["Ti_s_lim"] = (To_s + x_min) if casco_quente else (To_s - x_min)
+
+    d = abs(Ti_s - To_t)
+    if (2 * d - a) > 1e-9 and a > d:
+        y_min = 2.0 * d * (a - d) / (2.0 * d - a)
+        lim["Ti_t_lim"] = (To_t - y_min) if casco_quente else (To_t + y_min)
+
+    return lim
+
+
+def diagnosticar_termica(
+    Ti_s: float,
+    To_s: float,
+    Ti_t: float,
+    To_t: float,
+    passes_tubo: int,
+    modo_balanco: str,
+    q_calc: float = None,
+    cp_t: float = None,
+):
+    """Retorna lista de diagnósticos bloqueantes com ações específicas e justificativa."""
+    problemas = []
+    modo_vazoes = modo_balanco == "Fixar entradas, To_casco e ambas vazões (ṁ_s, ṁ_t)"
+
+    # 1. Temperaturas iguais (ΔT = 0)
+    if abs(Ti_s - To_s) < 1e-6:
+        problemas.append({
+            "titulo": "Temperatura de entrada e saída do casco estão iguais",
+            "acoes": [
+                f"**Aumente Ti casco** ou **abaixe To casco** (para o casco resfriar), ou o inverso se o casco estiver aquecendo (atualmente ambos = {Ti_s:.1f} °C)."
+            ],
+            "justificativa": "Sem variação de temperatura (ΔT = 0), não existe transferência de calor no lado do casco (q = ṁ·cp·ΔT = 0) e a vazão mássica tende ao infinito.",
+            "botoes": [],
+        })
+        return problemas
+
+    if abs(To_t - Ti_t) < 1e-6:
+        problemas.append({
+            "titulo": "Temperatura de entrada e saída do tubo estão iguais",
+            "acoes": [
+                f"**Aumente To tubo** ou **abaixe Ti tubo** (atualmente ambos = {Ti_t:.1f} °C)."
+            ],
+            "justificativa": "Sem variação de temperatura no fluido dos tubos (ΔT = 0), não há troca térmica válida e o balanço de energia não fecha.",
+            "botoes": [],
+        })
+        return problemas
+
+    casco_quente = Ti_s > To_s
+    tubo_aquece = To_t > Ti_t
+
+    # 2. Sentido térmico invertido (ambos aquecendo ou ambos resfriando)
+    if casco_quente != tubo_aquece:
+        if casco_quente:
+            acoes = [
+                f"**Aumente To tubo** para acima de {Ti_t:.1f} °C (ou **abaixe Ti tubo** para abaixo de {To_t:.1f} °C)."
+            ]
+            desc = "ambos os fluidos estão **resfriando** ao mesmo tempo"
+        else:
+            acoes = [
+                f"**Abaixe To tubo** para abaixo de {Ti_t:.1f} °C (ou **aumente Ti tubo** para acima de {To_t:.1f} °C)."
+            ]
+            desc = "ambos os fluidos estão **aquecendo** ao mesmo tempo"
+        problemas.append({
+            "titulo": "Sentido de troca térmica inconsistente (1ª Lei da Termodinâmica)",
+            "acoes": acoes,
+            "justificativa": f"Com as temperaturas atuais, {desc}. Pela conservação de energia, o calor cedido por um fluido precisa obrigatoriamente ser absorvido pelo outro.",
+            "botoes": [],
+        })
+        return problemas
+
+    # 3. Cruzamento nas extremidades (2ª Lei em contracorrente)
+    if casco_quente:
+        # Fluido quente = casco; fluido frio = tubo
+        if Ti_t >= To_s:
+            acoes = [
+                f"**Temperatura de entrada do fluido frio (Ti tubo = {Ti_t:.1f} °C) muito alta:** abaixe Ti tubo para **abaixo de {To_s:.1f} °C**.",
+                f"**Ou** aumente a temperatura de saída do fluido quente (**To casco**) para **acima de {Ti_t:.1f} °C**.",
+            ]
+            botoes = [
+                (f"⚡ Abaixar Ti tubo para {To_s - 5.0:.1f} °C", {"Ti_tubo": round(To_s - 5.0, 1)}),
+                (f"⚡ Aumentar To casco para {Ti_t + 5.0:.1f} °C", {"To_casco": round(Ti_t + 5.0, 1)}),
+            ]
+            problemas.append({
+                "titulo": "Cruzamento de temperaturas na extremidade fria (Ti tubo ≥ To casco)",
+                "acoes": acoes,
+                "justificativa": "Pela 2ª Lei da Termodinâmica, o calor só flui do fluido mais quente para o mais frio. O fluido quente (casco) não pode sair mais frio do que a temperatura em que o fluido frio (tubo) entra.",
+                "botoes": botoes,
+            })
+
+        if To_t >= Ti_s:
+            acoes = []
+            botoes = []
+            if modo_vazoes and q_calc and cp_t:
+                m_t_min = q_calc / (cp_t * max(Ti_s - Ti_t - 1.0, 1.0))
+                acoes.append(
+                    f"**Vazão do fluido frio (ṁ_t) muito baixa** (gerou To tubo = {To_t:.1f} °C ≥ Ti casco = {Ti_s:.1f} °C): **aumente ṁ_t para acima de {m_t_min:.1f} kg/s** ou **diminua ṁ_s**."
+                )
+                botoes.append((f"⚡ Aumentar ṁ_t para {m_t_min * 1.15:.1f} kg/s", {"m_tubo": round(m_t_min * 1.15, 2)}))
+            else:
+                acoes.append(
+                    f"**Temperatura de saída do fluido frio (To tubo = {To_t:.1f} °C) muito alta:** abaixe To tubo para **abaixo de {Ti_s:.1f} °C**."
+                )
+                botoes.append((f"⚡ Abaixar To tubo para {Ti_s - 5.0:.1f} °C", {"To_tubo": round(Ti_s - 5.0, 1)}))
+            acoes.append(
+                f"**Ou** aumente a temperatura de entrada do fluido quente (**Ti casco**) para **acima de {To_t:.1f} °C**."
+            )
+            botoes.append((f"⚡ Aumentar Ti casco para {To_t + 5.0:.1f} °C", {"Ti_casco": round(To_t + 5.0, 1)}))
+            problemas.append({
+                "titulo": "Cruzamento de temperaturas na extremidade quente (To tubo ≥ Ti casco)",
+                "acoes": acoes,
+                "justificativa": "Pela 2ª Lei da Termodinâmica, o fluido frio (tubo) não pode sair mais quente do que a temperatura máxima com que o fluido quente (casco) entra no trocador.",
+                "botoes": botoes,
+            })
+    else:
+        # Fluido frio = casco; fluido quente = tubo
+        if Ti_s >= To_t:
+            acoes = [
+                f"**Temperatura de entrada do fluido frio (Ti casco = {Ti_s:.1f} °C) muito alta:** abaixe Ti casco para **abaixo de {To_t:.1f} °C**.",
+                f"**Ou** aumente a temperatura de saída do fluido quente (**To tubo**) para **acima de {Ti_s:.1f} °C**.",
+            ]
+            botoes = [
+                (f"⚡ Abaixar Ti casco para {To_t - 5.0:.1f} °C", {"Ti_casco": round(To_t - 5.0, 1)}),
+            ]
+            problemas.append({
+                "titulo": "Cruzamento de temperaturas na extremidade fria (Ti casco ≥ To tubo)",
+                "acoes": acoes,
+                "justificativa": "Pela 2ª Lei da Termodinâmica, o fluido quente (tubo) não pode sair a uma temperatura menor ou igual à entrada do fluido frio (casco).",
+                "botoes": botoes,
+            })
+        if To_s >= Ti_t:
+            acoes = [
+                f"**Temperatura de saída do fluido frio (To casco = {To_s:.1f} °C) muito alta:** abaixe To casco para **abaixo de {Ti_t:.1f} °C**.",
+                f"**Ou** aumente a temperatura de entrada do fluido quente (**Ti tubo**) para **acima de {To_s:.1f} °C**.",
+            ]
+            botoes = [
+                (f"⚡ Abaixar To casco para {Ti_t - 5.0:.1f} °C", {"To_casco": round(Ti_t - 5.0, 1)}),
+            ]
+            problemas.append({
+                "titulo": "Cruzamento de temperaturas na extremidade quente (To casco ≥ Ti tubo)",
+                "acoes": acoes,
+                "justificativa": "Pela 2ª Lei da Termodinâmica, o fluido frio (casco) não pode sair mais quente do que a temperatura de entrada do fluido quente (tubo).",
+                "botoes": botoes,
+            })
+
+    if problemas:
+        return problemas
+
+    # 4. Fator de correção F indefinido (múltiplos passes nos tubos)
+    if passes_tubo > 1:
+        try:
+            fator_correcao(passes_tubo, Ti_s, To_s, Ti_t, To_t)
+        except ProjetoInviavel:
+            lim = limites_seguros_f(Ti_s, To_s, Ti_t, To_t)
+            acoes = [
+                f"**Número de passes muito alto ({passes_tubo} passes) para esse cruzamento de temperaturas:** abaixe o número de passes nos tubos para **1 passe** (contracorrente puro)."
+            ]
+            botoes = [("⚡ Mudar para 1 passe (contracorrente)", {"passes_tubo": 1})]
+
+            if casco_quente:
+                if "To_t_lim" in lim:
+                    val_seg = round(lim["To_t_lim"] - 1.5, 1)
+                    if modo_vazoes and q_calc and cp_t and lim.get("b_max", 0) > 0:
+                        m_min = q_calc / (cp_t * lim["b_max"])
+                        acoes.append(
+                            f"**Vazão do fluido frio (ṁ_t) muito baixa** (gerou To tubo = {To_t:.1f} °C): **aumente ṁ_t para acima de {m_min:.1f} kg/s** (assim To tubo cai para abaixo de {lim['To_t_lim']:.1f} °C)."
+                        )
+                        botoes.append((f"⚡ Aumentar ṁ_t para {m_min * 1.1:.1f} kg/s", {"m_tubo": round(m_min * 1.1, 2)}))
+                    else:
+                        acoes.append(
+                            f"**Temperatura de saída do fluido frio (To tubo = {To_t:.1f} °C) muito alta:** abaixe To tubo para **abaixo de {lim['To_t_lim']:.1f} °C**."
+                        )
+                        if val_seg > Ti_t + 0.5:
+                            botoes.append((f"⚡ Abaixar To tubo para {val_seg:.1f} °C", {"To_tubo": val_seg}))
+                if "To_s_lim" in lim:
+                    val_s = round(lim["To_s_lim"] + 1.5, 1)
+                    acoes.append(
+                        f"**Temperatura de saída do fluido quente (To casco = {To_s:.1f} °C) muito baixa:** aumente To casco para **acima de {lim['To_s_lim']:.1f} °C**."
+                    )
+                    if val_s < Ti_s - 0.5:
+                        botoes.append((f"⚡ Aumentar To casco para {val_s:.1f} °C", {"To_casco": val_s}))
+                if "Ti_t_lim" in lim:
+                    acoes.append(
+                        f"**Temperatura de entrada do fluido frio (Ti tubo = {Ti_t:.1f} °C) muito alta:** abaixe Ti tubo para **abaixo de {lim['Ti_t_lim']:.1f} °C**."
+                    )
+                if "Ti_s_lim" in lim:
+                    acoes.append(
+                        f"**Temperatura de entrada do fluido quente (Ti casco = {Ti_s:.1f} °C) muito baixa:** aumente Ti casco para **acima de {lim['Ti_s_lim']:.1f} °C**."
+                    )
+            else:
+                if "To_s_lim" in lim:
+                    acoes.append(
+                        f"**Temperatura de saída do fluido frio (To casco = {To_s:.1f} °C) muito alta:** abaixe To casco para **abaixo de {lim['To_s_lim']:.1f} °C**."
+                    )
+                if "To_t_lim" in lim:
+                    acoes.append(
+                        f"**Temperatura de saída do fluido quente (To tubo = {To_t:.1f} °C) muito baixa:** aumente To tubo para **acima de {lim['To_t_lim']:.1f} °C**."
+                    )
+                if "Ti_s_lim" in lim:
+                    acoes.append(
+                        f"**Temperatura de entrada do fluido frio (Ti casco = {Ti_s:.1f} °C) muito alta:** abaixe Ti casco para **abaixo de {lim['Ti_s_lim']:.1f} °C**."
+                    )
+                if "Ti_t_lim" in lim:
+                    acoes.append(
+                        f"**Temperatura de entrada do fluido quente (Ti tubo = {Ti_t:.1f} °C) muito baixa:** aumente Ti tubo para **acima de {lim['Ti_t_lim']:.1f} °C**."
+                    )
+
+            problemas.append({
+                "titulo": f"Cruzamento térmico incompatível com {passes_tubo} passes nos tubos (fator F indefinido)",
+                "acoes": acoes,
+                "justificativa": (
+                    "Em trocadores com 1 passe no casco e múltiplos passes nos tubos (2, 4, 6 ou 8), parte do trajeto ocorre em "
+                    "escoamento cocorrente. Isso impede grandes cruzamentos de temperatura (quando o fluido frio sai muito mais quente "
+                    "do que a saída do fluido quente), fazendo o fator de correção F da LMTD deixar de existir matematicamente. "
+                    "Trocar para 1 passe restaura o contracorrente puro (F = 1), ou ajustar as temperaturas reduz o cruzamento térmico."
+                ),
+                "botoes": botoes,
+            })
+
+    return problemas
+
+
+def diagnosticar_alertas_operacionais(res, esp: Especificacao):
+    """Traduz alertas de Reynolds, TEMA e fator F em recomendações práticas + justificativas."""
+    guias = []
+    l_ds = res.L / res.Ds
+    b_ds = res.B / res.Ds
+
+    if res.F < 0.75:
+        guias.append({
+            "tipo": "warning",
+            "titulo": f"Fator de correção F baixo (F = {res.F:.3f} < 0,75)",
+            "acao": (
+                f"**Abaixe o número de passes para 1** (contracorrente puro, F = 1,0), ou afaste as temperaturas de saída "
+                f"(abaixe To do fluido frio / aumente To do fluido quente)."
+            ),
+            "justificativa": (
+                "Na prática industrial (TEMA), projetos com F < 0,75 operam na região muito íngreme da curva de correção da LMTD: "
+                "pequenas variações de processo derrubam drasticamente a eficiência térmica e exigem áreas muito maiores."
+            ),
+        })
+
+    if res.Re_t < 10_000:
+        dica_passes = (
+            f"**aumente o número de passes nos tubos** (atualmente {esp.passes_tubo})"
+            if esp.passes_tubo < 8
+            else "**diminua o diâmetro do casco (Ds)**"
+        )
+        guias.append({
+            "tipo": "warning",
+            "titulo": f"Regime nos tubos abaixo do turbulento (Re_tubo = {res.Re_t:,.0f} < 10.000)",
+            "acao": (
+                f"Velocidade interna muito baixa ({res.v_t:.2f} m/s): {dica_passes}, **diminua Ds**, "
+                f"**aumente do** (menos tubos em paralelo) ou **aumente a vazão do tubo / carga térmica**."
+            ),
+            "justificativa": (
+                "A correlação de Sieder & Tate e o fator de atrito interno usados no modelo são válidos apenas para "
+                "escoamento plenamente turbulento (Re ≥ 10.000). Abaixo disso, o modelo tende a superestimar h_t e "
+                "velocidades lentas favorecem incrustação (fouling) dentro dos tubos."
+            ),
+        })
+
+    if res.Re_s < 10_000:
+        guias.append({
+            "tipo": "warning",
+            "titulo": f"Regime no casco abaixo do turbulento (Re_casco = {res.Re_s:,.0f} < 10.000)",
+            "acao": (
+                f"Espaçamento entre chicanas (B = {res.B:.3f} m) ou casco (Ds = {res.Ds:.3f} m) muito grandes: "
+                f"**abaixe B** ou **abaixe Ds** (ou aumente a vazão do casco)."
+            ),
+            "justificativa": (
+                "A correlação de Kern usada para o lado do casco assume regime turbulento (Re > 10.000). "
+                "Aproximar as chicanas reduz a área transversal de passagem (As), elevando a velocidade e a turbulência."
+            ),
+        })
+
+    if res.Re_s >= 40_000:
+        guias.append({
+            "tipo": "warning",
+            "titulo": f"Reynolds no casco acima do limite da correlação (Re_casco = {res.Re_s:,.0f} ≥ 40.000)",
+            "acao": (
+                f"Velocidade no casco muito alta: **aumente o espaçamento entre chicanas (B)** ou **aumente o diâmetro do casco (Ds)**."
+            ),
+            "justificativa": (
+                "A constante b0 = 0,72 adotada na Eq. (32) para o fator de atrito do casco é válida somente para Re_casco < 40.000. "
+                "Além disso, velocidades excessivas elevam fortemente a perda de carga e o risco de vibração nos tubos."
+            ),
+        })
+
+    if l_ds < 3.0:
+        dica_p = (
+            f"**abaixe o número de passes nos tubos** (atualmente {esp.passes_tubo}), "
+            if esp.passes_tubo > 2
+            else ""
+        )
+        guias.append({
+            "tipo": "warning",
+            "titulo": f"Trocador muito curto e largo — 'efeito panqueca' (L/Ds = {l_ds:.2f} < 3,0)",
+            "acao": (
+                f"{dica_p}**abaixe o diâmetro do casco (Ds = {res.Ds:.3f} m)** ou **aumente o diâmetro do tubo (do)**."
+            ),
+            "justificativa": (
+                "A norma TEMA recomenda razão L/Ds entre 3 e 10. Cascos muito largos com tubos curtos (como L = "
+                f"{res.L:.2f} m e {res.Nt} tubos) encarecem muito os espelhos, cabeçotes e furação — custos reais "
+                "que a fórmula simplificada Ci(A) não enxerga."
+            ),
+        })
+    elif l_ds > 10.0:
+        guias.append({
+            "tipo": "warning",
+            "titulo": f"Trocador muito alongado e fino (L/Ds = {l_ds:.2f} > 10,0)",
+            "acao": (
+                f"**Aumente o diâmetro do casco (Ds = {res.Ds:.3f} m)** ou **diminua o diâmetro do tubo (do)** "
+                f"(ou aumente o número de passes para acomodar mais tubos)."
+            ),
+            "justificativa": (
+                "A norma TEMA recomenda L/Ds ≤ 10 para evitar equipamentos excessivamente esbeltos, com alta perda de carga "
+                "e difícil limpeza ou remoção do feixe tubular."
+            ),
+        })
+
+    if res.L > 6.0:
+        guias.append({
+            "tipo": "warning",
+            "titulo": f"Comprimento dos tubos acima do padrão comercial (L = {res.L:.2f} m > 6,0 m)",
+            "acao": "**Aumente Ds** ou **abaixe do** para colocar mais tubos em paralelo e encurtar o trocador.",
+            "justificativa": (
+                "Tubos acima de 6 m (~20 pés) encarecem fabricação, transporte e exigem grande espaço livre na planta "
+                "para retirada do feixe em manutenção."
+            ),
+        })
+
+    if b_ds < 0.2:
+        b_min = 0.2 * res.Ds
+        guias.append({
+            "tipo": "warning",
+            "titulo": f"Chicanas muito próximas entre si (B/Ds = {b_ds:.2f} < 0,20)",
+            "acao": f"**Aumente o espaçamento entre chicanas (B)** para pelo menos **{b_min:.3f} m** ou **abaixe Ds**.",
+            "justificativa": (
+                "Pela norma TEMA, B < 0,2·Ds gera perda de carga desproporcional no casco, dificulta a montagem/limpeza "
+                "e aumenta vazamentos nas folgas entre tubos e chicanas."
+            ),
+        })
+    elif b_ds > 1.0:
+        guias.append({
+            "tipo": "warning",
+            "titulo": f"Chicanas muito afastadas entre si (B/Ds = {b_ds:.2f} > 1,00)",
+            "acao": f"**Abaixe o espaçamento entre chicanas (B)** para no máximo **{res.Ds:.3f} m** ou **aumente Ds**.",
+            "justificativa": (
+                "Pela norma TEMA, B > Ds faz o fluido escoar mais longitudinalmente do que transversalmente ao feixe, "
+                "reduzindo a eficiência térmica e aumentando o risco de vibração mecânica dos tubos sem suporte."
+            ),
+        })
+
+    if res.B > res.L:
+        guias.append({
+            "tipo": "warning",
+            "titulo": f"Espaçamento entre chicanas maior que o trocador (B = {res.B:.3f} m > L = {res.L:.2f} m)",
+            "acao": f"**Abaixe B** para abaixo de {res.L:.2f} m ou **abaixe Ds** para alongar o trocador.",
+            "justificativa": "Fisicamente não é possível instalar chicanas com espaçamento maior do que o próprio comprimento dos tubos.",
+        })
+
+    return guias
 
 
 # ==============================================================================
@@ -98,12 +491,17 @@ if "caso_selecionado" not in st.session_state:
     st.session_state["caso_selecionado"] = 1
     carregar_caso(1)
 
-if "aplicar_geometria" in st.session_state and st.session_state["aplicar_geometria"] is not None:
+if st.session_state.get("aplicar_geometria") is not None:
     ds_n, do_n, b_n = st.session_state["aplicar_geometria"]
     st.session_state["Ds"] = float(np.clip(ds_n, 0.10, 1.50))
     st.session_state["do_mm"] = float(np.clip(do_n * 1e3, 15.0, 51.0))
     st.session_state["B"] = float(np.clip(b_n, 0.05, 0.50))
     st.session_state["aplicar_geometria"] = None
+
+if st.session_state.get("aplicar_ajuste") is not None:
+    for chave_aj, val_aj in st.session_state["aplicar_ajuste"].items():
+        st.session_state[chave_aj] = val_aj
+    st.session_state["aplicar_ajuste"] = None
 
 
 # ==============================================================================
@@ -132,6 +530,9 @@ with st.sidebar:
         Ds = st.slider("Diâmetro interno do casco — Ds [m]", 0.10, 1.50, step=0.005, key="Ds")
         do_mm = st.slider("Diâmetro externo do tubo — do [mm]", 15.0, 51.0, step=0.5, key="do_mm")
         B = st.slider("Espaçamento entre chicanas — B [m]", 0.05, 0.50, step=0.005, key="B")
+        b_tema_min = max(0.05, 0.2 * Ds)
+        b_tema_max = min(0.50, Ds)
+        st.caption(f"📏 Faixa TEMA sugerida para B (com Ds={Ds:.2f} m): **{b_tema_min:.3f} a {b_tema_max:.3f} m**")
     else:
         Ds = st.session_state["Ds"]
         do_mm = st.session_state["do_mm"]
@@ -187,6 +588,19 @@ with st.sidebar:
     else:
         To_tubo = c2.number_input("To tubo [°C]", -50.0, 500.0, step=1.0, format="%.2f", key="To_tubo")
 
+    # Dica em tempo real da faixa segura de To_tubo
+    if To_tubo is not None and abs(Ti_casco - To_casco) > 1e-6:
+        if Ti_casco > To_casco and To_casco > Ti_tubo:
+            if passes_tubo == 1:
+                st.caption(f"🌡️ Faixa viável para To tubo (1 passe): **{Ti_tubo + 0.5:.1f} a {Ti_casco - 0.5:.1f} °C**")
+            else:
+                lim_live = limites_seguros_f(Ti_casco, To_casco, Ti_tubo, To_tubo)
+                if "To_t_lim" in lim_live:
+                    st.caption(
+                        f"🌡️ Faixa viável para To tubo ({passes_tubo} passes): "
+                        f"**{Ti_tubo + 0.5:.1f} a {lim_live['To_t_lim'] - 0.5:.1f} °C**"
+                    )
+
     if modo_balanco == "Fixar temperaturas + Carga (q)":
         q_mw = st.number_input("Carga térmica q [MW]", 0.05, 50.0, step=0.1, format="%.3f", key="q_mw")
         m_casco_in = None
@@ -228,21 +642,44 @@ with st.sidebar:
 
 
 # ==============================================================================
-# MONTAGEM DA ESPECIFICAÇÃO E CÁLCULO PRINCIPAL
+# VALIDAÇÃO TERMODINÂMICA PRÉVIA E CÁLCULO PRINCIPAL
 # ==============================================================================
 st.title("🔥 Simulador e Otimizador de Trocador de Calor Casco-Tubo (GWO)")
 st.caption("Baseado no modelo termo-hidráulico e econômico de Vieira, Rieger & Mariani (2017) com suporte a restrições TEMA.")
 
+fluido_s = fluido_custom(st.session_state["fluido_casco_nome"], fs_rho, fs_cp, fs_mu, fs_k, fs_Rf)
+fluido_t = fluido_custom(st.session_state["fluido_tubo_nome"], ft_rho, ft_cp, ft_mu, ft_k, ft_Rf)
+
+# Determina To_tubo efetiva para diagnóstico prévio
+q_prev = None
+if modo_balanco == "Fixar entradas, To_casco e ambas vazões (ṁ_s, ṁ_t)":
+    q_prev = m_casco_in * fluido_s.cp * abs(Ti_casco - To_casco)
+    sinal_prev = 1.0 if Ti_casco > To_casco else -1.0
+    To_tubo_efetiva = Ti_tubo + sinal_prev * q_prev / (m_tubo_in * fluido_t.cp) if abs(Ti_casco - To_casco) > 1e-6 else Ti_tubo
+else:
+    To_tubo_efetiva = To_tubo
+
+problemas_term = diagnosticar_termica(
+    Ti_casco, To_casco, Ti_tubo, To_tubo_efetiva, passes_tubo, modo_balanco, q_prev, fluido_t.cp
+)
+
+if problemas_term:
+    for idx_p, prob in enumerate(problemas_term):
+        st.error(f"### ❌ {prob['titulo']}")
+        st.markdown("**O que você pode alterar na barra lateral:**")
+        for acao in prob["acoes"]:
+            st.markdown(f"- {acao}")
+        st.info(f"**Por quê? (Justificativa física):** {prob['justificativa']}")
+        if prob["botoes"]:
+            cols_btn = st.columns(len(prob["botoes"]))
+            for j, (rotulo_b, payload_b) in enumerate(prob["botoes"]):
+                if cols_btn[j].button(rotulo_b, key=f"fix_{idx_p}_{j}", type="primary"):
+                    st.session_state["aplicar_ajuste"] = payload_b
+                    st.rerun()
+    st.stop()
+
 try:
-    fluido_s = fluido_custom(st.session_state["fluido_casco_nome"], fs_rho, fs_cp, fs_mu, fs_k, fs_Rf)
-    fluido_t = fluido_custom(st.session_state["fluido_tubo_nome"], ft_rho, ft_cp, ft_mu, ft_k, ft_Rf)
-
-    if abs(Ti_casco - To_casco) < 1e-6:
-        raise ValueError("Ti_casco e To_casco não podem ser iguais.")
-
     if modo_balanco == "Fixar temperaturas + Carga (q)":
-        if abs(To_tubo - Ti_tubo) < 1e-6:
-            raise ValueError("Ti_tubo e To_tubo não podem ser iguais.")
         esp = Especificacao(
             fluido_s, fluido_t, Ti_casco, To_casco, Ti_tubo, To_tubo,
             passes_tubo=passes_tubo, arranjo=arranjo, q=q_mw * 1e6,
@@ -250,8 +687,6 @@ try:
             custo_energia=custo_energia, horas_ano=horas_ano, anos=int(anos), taxa=taxa_pct / 100.0,
         )
     elif modo_balanco == "Fixar temperaturas + Vazão do casco (ṁ_s)":
-        if abs(To_tubo - Ti_tubo) < 1e-6:
-            raise ValueError("Ti_tubo e To_tubo não podem ser iguais.")
         esp = Especificacao(
             fluido_s, fluido_t, Ti_casco, To_casco, Ti_tubo, To_tubo,
             passes_tubo=passes_tubo, arranjo=arranjo, q=None,
@@ -259,12 +694,9 @@ try:
             custo_energia=custo_energia, horas_ano=horas_ano, anos=int(anos), taxa=taxa_pct / 100.0,
         )
     else:
-        q_calc = m_casco_in * fluido_s.cp * abs(Ti_casco - To_casco)
-        sinal = 1.0 if Ti_casco > To_casco else -1.0
-        To_tubo_calc = Ti_tubo + sinal * q_calc / (m_tubo_in * fluido_t.cp)
         esp = Especificacao(
-            fluido_s, fluido_t, Ti_casco, To_casco, Ti_tubo, To_tubo_calc,
-            passes_tubo=passes_tubo, arranjo=arranjo, q=q_calc,
+            fluido_s, fluido_t, Ti_casco, To_casco, Ti_tubo, To_tubo_efetiva,
+            passes_tubo=passes_tubo, arranjo=arranjo, q=q_prev,
             m_casco=m_casco_in, m_tubo=m_tubo_in, razao_di_do=razao_di_do, k_parede=k_parede,
             custo_energia=custo_energia, horas_ano=horas_ano, anos=int(anos), taxa=taxa_pct / 100.0,
         )
@@ -294,8 +726,30 @@ try:
         Ds_atual, do_atual, B_atual = res.Ds, res.do, res.B
 
 except (ProjetoInviavel, ValueError, ZeroDivisionError) as err:
-    st.error(f"**Projeto inviável com os parâmetros atuais:** {err}")
-    st.info("Ajuste as temperaturas, o número de passes ou relaxe as restrições na barra lateral.")
+    msg_err = str(err)
+    st.error(f"### ❌ Não foi possível fechar o projeto no modo atual\n**Detalhe:** {msg_err}")
+    if "Restrições de engenharia" in msg_err:
+        dicas_estr = []
+        if "Re_t=" in msg_err:
+            dicas_estr.append(
+                f"**Reynolds no tubo muito baixo:** aumente o número de passes nos tubos (atualmente {passes_tubo}) "
+                f"ou desmarque **Modo estrito** na barra lateral para ver a solução mais próxima."
+            )
+        if "L/Ds=" in msg_err and "<" in msg_err:
+            dicas_estr.append(
+                f"**Trocador muito curto para {passes_tubo} passes:** reduza o número de passes nos tubos (tente 1 ou 2 passes)."
+            )
+        if "L=" in msg_err:
+            dicas_estr.append("**Comprimento acima de 6 m:** reduza a carga térmica ou desmarque **Modo estrito**.")
+        if not dicas_estr:
+            dicas_estr.append("Desmarque **Modo estrito** na barra lateral para inspecionar a melhor solução encontrada e ver exatamente qual restrição ficou no limite.")
+        st.markdown("**O que ajustar:**")
+        for d_e in dicas_estr:
+            st.markdown(f"- {d_e}")
+        st.info(
+            "**Por quê?** No **Modo estrito**, o otimizador rejeita o projeto se qualquer regra da norma TEMA ou limite de "
+            "Reynolds (Re ≥ 10.000) não puder ser cumprido dentro das dimensões comerciais."
+        )
     st.stop()
 
 
@@ -413,21 +867,23 @@ with aba1:
     m3.metric("Razão B / Ds", f"{res.B / res.Ds:.2f}")
     m4.metric("Re (tubo / casco)", f"{res.Re_t:,.0f} / {res.Re_s:,.0f}")
     m5.metric("ΔP (tubo / casco)", f"{res.dP_t/1e3:.2f} / {res.dP_s/1e3:.2f} kPa")
-    m6.metric("Potência Bomba", f"{res.potencia:.1f} W")
+    m6.metric("Fator F / Bomba", f"F={res.F:.3f} | {res.potencia:.0f} W")
 
-    # Diagnóstico de alertas e conformidade TEMA
-    violacoes_tema = []
-    if TEM_RESTRICOES:
-        _, violacoes_tema = verificar_restricoes(res, RestricoesEngenharia())
-
-    if not res.avisos and not violacoes_tema:
-        st.success("✅ Projeto dentro da faixa turbulenta das correlações (Re ≥ 10.000) e das proporções TEMA (3 ≤ L/Ds ≤ 10; 0,2 ≤ B/Ds ≤ 1; L ≤ 6 m).")
+    # Diagnóstico guiado com ação específica e justificativa
+    guias = diagnosticar_alertas_operacionais(res, esp)
+    if not guias:
+        st.success(
+            "✅ **Projeto plenamente adequado:** atende ao regime turbulento das correlações "
+            "(10.000 ≤ Re < 40.000), fator F ≥ 0,75 e proporções construtivas da norma TEMA."
+        )
     else:
-        for av in res.avisos:
-            st.warning(f"⚠️ {av}")
-        for v in violacoes_tema:
-            if not v.startswith("Re_"):
-                st.warning(f"📐 Restrição geométrica TEMA: {v}")
+        st.markdown(f"#### ⚠️ Pontos de atenção ({len(guias)}) — o que ajustar e por quê")
+        for g in guias:
+            st.warning(
+                f"**{g['titulo']}**\n\n"
+                f"🔧 **Como corrigir:** {g['acao']}\n\n"
+                f"📘 **Justificativa:** {g['justificativa']}"
+            )
 
     g1, g2 = st.columns(2)
     with g1:
@@ -744,7 +1200,6 @@ with aba4:
                 use_container_width=True,
             )
 
-            # Botões para aplicar geometria otimizada nos sliders manuais
             bc1, bc2 = st.columns(2)
             if "artigo" in cmp_data and not isinstance(cmp_data["artigo"], str):
                 ra = cmp_data["artigo"].resultado
@@ -757,7 +1212,6 @@ with aba4:
                     st.session_state["aplicar_geometria"] = (re_.Ds, re_.do, re_.B)
                     st.rerun()
 
-            # Gráfico de convergência
             fig_conv = go.Figure()
             if "artigo" in cmp_data and not isinstance(cmp_data["artigo"], str):
                 h_art = cmp_data["artigo"].historico
